@@ -27,14 +27,29 @@ import com.getcapacitor.WebViewListener;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.ref.WeakReference;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Collections;
+import java.util.zip.GZIPInputStream;
+
+import androidx.webkit.WebViewCompat;
+import androidx.webkit.WebViewFeature;
 
 public class MainActivity extends BridgeActivity {
 
     private static final String tag = "MonoDL";
     private static final int req_storage = 1001;
+    private static final String TIDAL_ORIGIN = "https://listen.tidal.com";
+    private static final String tidal_flag_js = "window.__tidalOriginExtension=true;";
 
     private volatile Pending pending;
 
@@ -83,6 +98,7 @@ public class MainActivity extends BridgeActivity {
             @Override
             public void onPageStarted(WebView wv) {
                 wv.evaluateJavascript(hook_js, null);
+                wv.evaluateJavascript("window.__tidalOriginExtension=true;", null);
                 wv.evaluateJavascript(
                     "if('serviceWorker' in navigator){" +
                     "navigator.serviceWorker.getRegistrations().then(function(r){r.forEach(function(reg){reg.unregister();});});" +
@@ -108,6 +124,12 @@ public class MainActivity extends BridgeActivity {
 
         final WebView wv = bridge.getWebView();
         if (wv != null) {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                WebViewCompat.addDocumentStartJavaScript(
+                    wv,
+                    tidal_flag_js,
+                    Collections.singleton("*"));
+            }
             wv.addJavascriptInterface(new DLInterface(this), "AndroidDownload");
 
             wv.setDownloadListener(new DownloadListener() {
@@ -164,6 +186,23 @@ public class MainActivity extends BridgeActivity {
                     oc.onReceivedHttpError(v, req, resp);
                 }
 
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest req) {
+                    try {
+                        Uri u = req.getUrl();
+                        if (isTidalHost(u.getHost())) {
+                            String m = req.getMethod();
+                            if ("GET".equals(m) || "HEAD".equals(m) || "OPTIONS".equals(m)) {
+                                WebResourceResponse r = interceptTidal(u.toString(), m, req.getRequestHeaders());
+                                if (r != null) return r;
+                            }
+                        }
+                    } catch (Exception e) {
+                        Log.e(tag, "tidal intercept error", e);
+                    }
+                    return oc.shouldInterceptRequest(v, req);
+                }
+
                 private boolean shouldOpenExternally(WebView v, Uri u) {
                     String h = u.getHost();
                     if (h != null && isOAuthDomain(h) && !h.endsWith(".monochrome.tf") && !h.equals("monochrome.tf")) {
@@ -176,6 +215,115 @@ public class MainActivity extends BridgeActivity {
                 }
             });
         }
+    }
+
+    private static boolean isTidalHost(String host) {
+        return host != null && (host.equals("tidal.com") || host.endsWith(".tidal.com"));
+    }
+
+    private static WebResourceResponse interceptTidal(String urlStr, String method, Map<String, String> reqHeaders) {
+        int redirects = 0;
+        while (true) {
+            HttpURLConnection conn = null;
+            try {
+                URL url = new URL(urlStr);
+                conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod(method);
+                conn.setInstanceFollowRedirects(false);
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(30000);
+                conn.setUseCaches(false);
+
+                for (Map.Entry<String, String> e : reqHeaders.entrySet()) {
+                    String k = e.getKey();
+                    if (k == null || e.getValue() == null) continue;
+                    String lk = k.toLowerCase(Locale.US);
+                    if (lk.equals("host") || lk.equals("connection") || lk.equals("accept-encoding")
+                            || lk.equals("origin") || lk.equals("referer") || lk.equals("content-length")) {
+                        continue;
+                    }
+                    conn.setRequestProperty(k, e.getValue());
+                }
+                conn.setRequestProperty("Origin", TIDAL_ORIGIN);
+                conn.setRequestProperty("Referer", TIDAL_ORIGIN + "/");
+
+                final int code = conn.getResponseCode();
+                if (code == HttpURLConnection.HTTP_MOVED_PERM || code == HttpURLConnection.HTTP_MOVED_TEMP
+                        || code == HttpURLConnection.HTTP_SEE_OTHER || code == 307 || code == 308) {
+                    String loc = conn.getHeaderField("Location");
+                    conn.disconnect();
+                    if (loc != null && !loc.isEmpty() && redirects < 5) {
+                        urlStr = new URL(url, loc).toString();
+                        redirects++;
+                        continue;
+                    }
+                    return null;
+                }
+
+                Map<String, String> respHeaders = new HashMap<>();
+                for (Map.Entry<String, List<String>> e : conn.getHeaderFields().entrySet()) {
+                    if (e.getKey() == null || e.getValue() == null || e.getValue().isEmpty()) continue;
+                    respHeaders.put(e.getKey(), e.getValue().get(0));
+                }
+                respHeaders.put("Access-Control-Allow-Origin", "*");
+                respHeaders.put("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+                respHeaders.put("Access-Control-Allow-Headers", "*");
+
+                String mime = "application/octet-stream";
+                String encoding = "UTF-8";
+                String contentType = conn.getContentType();
+                if (contentType != null) {
+                    String[] parts = contentType.split(";");
+                    if (!parts[0].trim().isEmpty()) mime = parts[0].trim();
+                    for (int i = 1; i < parts.length; i++) {
+                        String p = parts[i].trim();
+                        if (p.toLowerCase(Locale.US).startsWith("charset=")) {
+                            encoding = p.substring(8).trim();
+                        }
+                    }
+                }
+
+                InputStream body = (code >= 400 && conn.getErrorStream() != null)
+                        ? conn.getErrorStream()
+                        : conn.getInputStream();
+                if ("gzip".equalsIgnoreCase(conn.getContentEncoding())) {
+                    body = new GZIPInputStream(body);
+                    removeHeader(respHeaders, "Content-Encoding");
+                    removeHeader(respHeaders, "Content-Length");
+                }
+
+                final HttpURLConnection fc = conn;
+                InputStream stream = new FilterInputStream(body) {
+                    @Override
+                    public void close() throws IOException {
+                        try {
+                            super.close();
+                        } finally {
+                            fc.disconnect();
+                        }
+                    }
+                };
+
+                String reason = conn.getResponseMessage();
+                if (reason == null || reason.isEmpty()) reason = "OK";
+                return new WebResourceResponse(mime, encoding, code, reason, respHeaders, stream);
+            } catch (Exception e) {
+                Log.e(tag, "tidal intercept failed: " + urlStr, e);
+                if (conn != null) conn.disconnect();
+                return null;
+            }
+        }
+    }
+
+    private static void removeHeader(Map<String, String> headers, String name) {
+        String found = null;
+        for (String key : headers.keySet()) {
+            if (name.equalsIgnoreCase(key)) {
+                found = key;
+                break;
+            }
+        }
+        if (found != null) headers.remove(found);
     }
 
     private static String cleanName(String n) {
