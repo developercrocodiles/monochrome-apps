@@ -11,12 +11,12 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@capacitor/android": "^8.4.0",
-    "@capacitor/app": "^8.1.0",
-    "@capacitor/browser": "^8.0.3",
-    "@capacitor/cli": "^8.4.0",
-    "@capacitor/core": "^8.4.0",
-    "@capacitor/ios": "^8.4.0",
-    "@capgo/capacitor-media-session": "^8.0.19"
+    "@capacitor/android": "^5.7.8",
+    "@capacitor/app": "^5.0.7",
+    "@capacitor/browser": "^5.0.7",
+    "@capacitor/cli": "^5.7.8",
+    "@capacitor/core": "^5.7.8",
+    "@capacitor/ios": "^5.7.8",
+    "@capgo/capacitor-media-session": "^5.1.0"
   }
 }
